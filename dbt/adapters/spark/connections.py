@@ -1,17 +1,11 @@
 from contextlib import contextmanager
 
-from dbt.adapters.contracts.connection import (
-    AdapterResponse,
-    ConnectionState,
-    Connection,
-    Credentials,
-)
-from dbt.adapters.events.logging import AdapterLogger
-from dbt.adapters.exceptions import FailedToConnectError
+import dbt.exceptions
+from dbt.adapters.base import Credentials
 from dbt.adapters.sql import SQLConnectionManager
-from dbt_common.exceptions import DbtConfigError, DbtRuntimeError, DbtDatabaseError
-
-from dbt_common.utils.encoding import DECIMALS
+from dbt.contracts.connection import ConnectionState, AdapterResponse
+from dbt.events import AdapterLogger
+from dbt.utils import DECIMALS
 from dbt.adapters.spark import __version__
 
 try:
@@ -28,7 +22,8 @@ except ImportError:
     pyodbc = None
 from datetime import datetime
 import sqlparams
-from dbt_common.dataclass_schema import StrEnum
+from dbt.contracts.connection import Connection
+from dbt.dataclass_schema import StrEnum
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Union, Tuple, List, Generator, Iterable, Sequence
 
@@ -78,6 +73,7 @@ class SparkCredentials(Credentials):
     auth: Optional[str] = None
     kerberos_service_name: Optional[str] = None
     organization: str = "0"
+    sparkservertype: str = 3
     connect_retries: int = 0
     connect_timeout: int = 10
     use_ssl: bool = False
@@ -97,15 +93,15 @@ class SparkCredentials(Credentials):
 
     def __post_init__(self) -> None:
         if self.method is None:
-            raise DbtRuntimeError("Must specify `method` in profile")
+            raise dbt.exceptions.DbtRuntimeError("Must specify `method` in profile")
         if self.host is None:
-            raise DbtRuntimeError("Must specify `host` in profile")
+            raise dbt.exceptions.DbtRuntimeError("Must specify `host` in profile")
         if self.schema is None:
-            raise DbtRuntimeError("Must specify `schema` in profile")
+            raise dbt.exceptions.DbtRuntimeError("Must specify `schema` in profile")
 
         # spark classifies database and schema as the same thing
         if self.database is not None and self.database != self.schema:
-            raise DbtRuntimeError(
+            raise dbt.exceptions.DbtRuntimeError(
                 f"    schema: {self.schema} \n"
                 f"    database: {self.database} \n"
                 f"On Spark, database must be omitted or have the same value as"
@@ -117,7 +113,7 @@ class SparkCredentials(Credentials):
             try:
                 import pyodbc  # noqa: F401
             except ImportError as e:
-                raise DbtRuntimeError(
+                raise dbt.exceptions.DbtRuntimeError(
                     f"{self.method} connection method requires "
                     "additional dependencies. \n"
                     "Install the additional required dependencies with "
@@ -126,7 +122,7 @@ class SparkCredentials(Credentials):
                 ) from e
 
         if self.method == SparkConnectionMethod.ODBC and self.cluster and self.endpoint:
-            raise DbtRuntimeError(
+            raise dbt.exceptions.DbtRuntimeError(
                 "`cluster` and `endpoint` cannot both be set when"
                 f" using {self.method} method to connect to Spark"
             )
@@ -135,7 +131,7 @@ class SparkCredentials(Credentials):
             self.method == SparkConnectionMethod.HTTP
             or self.method == SparkConnectionMethod.THRIFT
         ) and not (ThriftState and THttpClient and hive):
-            raise DbtRuntimeError(
+            raise dbt.exceptions.DbtRuntimeError(
                 f"{self.method} connection method requires "
                 "additional dependencies. \n"
                 "Install the additional required dependencies with "
@@ -146,7 +142,7 @@ class SparkCredentials(Credentials):
             try:
                 import pyspark  # noqa: F401
             except ImportError as e:
-                raise DbtRuntimeError(
+                raise dbt.exceptions.DbtRuntimeError(
                     f"{self.method} connection method requires "
                     "additional dependencies. \n"
                     "Install the additional required dependencies with "
@@ -296,11 +292,13 @@ class PyhiveConnectionWrapper(SparkConnectionWrapper):
         if poll_state.errorMessage:
             logger.debug("Poll response: {}".format(poll_state))
             logger.debug("Poll status: {}".format(state))
-            raise DbtDatabaseError(poll_state.errorMessage)
+            raise dbt.exceptions.DbtDatabaseError(poll_state.errorMessage)
 
         elif state not in STATE_SUCCESS:
             status_type = ThriftState._VALUES_TO_NAMES.get(state, "Unknown<{!r}>".format(state))
-            raise DbtDatabaseError("Query failed with status: {}".format(status_type))
+            raise dbt.exceptions.DbtDatabaseError(
+                "Query failed with status: {}".format(status_type)
+            )
 
         logger.debug("Poll status: {}, query complete".format(state))
 
@@ -361,9 +359,9 @@ class SparkConnectionManager(SQLConnectionManager):
             thrift_resp = exc.args[0]
             if hasattr(thrift_resp, "status"):
                 msg = thrift_resp.status.errorMessage
-                raise DbtRuntimeError(msg)
+                raise dbt.exceptions.DbtRuntimeError(msg)
             else:
-                raise DbtRuntimeError(str(exc))
+                raise dbt.exceptions.DbtRuntimeError(str(exc))
 
     def cancel(self, connection: Connection) -> None:
         connection.handle.cancel()
@@ -393,7 +391,7 @@ class SparkConnectionManager(SQLConnectionManager):
 
         for key in required:
             if not hasattr(creds, key):
-                raise DbtConfigError(
+                raise dbt.exceptions.DbtProfileError(
                     "The config '{}' is required when using the {} method"
                     " to connect to Spark".format(key, method)
                 )
@@ -483,13 +481,16 @@ class SparkConnectionManager(SQLConnectionManager):
                         http_path = cls.SPARK_SQL_ENDPOINT_HTTP_PATH.format(
                             endpoint=creds.endpoint
                         )
-                    else:
-                        raise DbtConfigError(
+                    elif creds.sparkservertype is not None and creds.sparkservertype != "DFI":
+                        raise dbt.exceptions.DbtProfileError(
                             "Either `cluster` or `endpoint` must set when"
                             " using the odbc method to connect to Spark"
                         )
+                    else:
+                        http_path = ""
 
-                    cls.validate_creds(creds, required_fields)
+                    if creds.sparkservertype is not None and creds.sparkservertype != "DFI":
+                        cls.validate_creds(creds, required_fields)
 
                     dbt_spark_version = __version__.version
                     user_agent_entry = (
@@ -506,9 +507,11 @@ class SparkConnectionManager(SQLConnectionManager):
                         PORT=creds.port,
                         UID="token",
                         PWD=creds.token,
-                        HTTPPath=http_path,
+                        #HTTPPath=http_path,
                         AuthMech=3,
-                        SparkServerType=3,
+                        #SparkServerType="DFI",
+                        SparkServerType=creds.sparkservertype,
+                        #SparkServerType=3,
                         ThriftTransport=2,
                         SSL=1,
                         UserAgentEntry=user_agent_entry,
@@ -528,7 +531,9 @@ class SparkConnectionManager(SQLConnectionManager):
                         Connection(server_side_parameters=creds.server_side_parameters)
                     )
                 else:
-                    raise DbtConfigError(f"invalid credential method: {creds.method}")
+                    raise dbt.exceptions.DbtProfileError(
+                        f"invalid credential method: {creds.method}"
+                    )
                 break
             except Exception as e:
                 exc = e
@@ -538,11 +543,11 @@ class SparkConnectionManager(SQLConnectionManager):
                     msg = "Failed to connect"
                     if creds.token is not None:
                         msg += ", is your token valid?"
-                    raise FailedToConnectError(msg) from e
+                    raise dbt.exceptions.FailedToConnectError(msg) from e
                 retryable_message = _is_retryable_error(e)
                 if retryable_message and creds.connect_retries > 0:
                     msg = (
-                        f"Warning: {retryable_message}\n\tRetrying in "
+                        f"Warning: {retryable_message}\n\tXRetrying in "
                         f"{creds.connect_timeout} seconds "
                         f"({i} of {creds.connect_retries})"
                     )
@@ -552,14 +557,14 @@ class SparkConnectionManager(SQLConnectionManager):
                     msg = (
                         f"Warning: {getattr(exc, 'message', 'No message')}, "
                         f"retrying due to 'retry_all' configuration "
-                        f"set to true.\n\tRetrying in "
+                        f"set to true.\n\tYRetrying in "
                         f"{creds.connect_timeout} seconds "
                         f"({i} of {creds.connect_retries})"
                     )
                     logger.warning(msg)
                     time.sleep(creds.connect_timeout)
                 else:
-                    raise FailedToConnectError("failed to connect") from e
+                    raise dbt.exceptions.FailedToConnectError("failed to connect") from e
         else:
             raise exc  # type: ignore
 
